@@ -1,0 +1,57 @@
+---
+# OPTIMA first-pass univariate LCL-format experiment
+# - one day = one sample
+# - 30-minute resolution
+# - normalize=True, pit=False, vectorize=False, conditioning=False
+
+# dataset setting
+dataset: lcl_electricity
+data_root: ../../../data/augmentation
+artifact_root: ../../../data/augmentation/generated/energydiff
+load_data: True
+normalize_data: True
+pit_data: False
+vectorize_data: False
+style_vectorize: chronological
+vectorize_window_size: 3
+resolution: 30min
+train_season: whole_year
+val_season: whole_year
+lcl_use_fraction: 1.0
+
+# model setting
+model_class: gpt2
+conditioning: False
+dim_base: 64
+dropout: 0.1
+num_attn_head: 4
+num_encoder_layer: 0
+num_decoder_layer: 1
+dim_feedforward: 256
+
+# diffusion setting
+dpm_solver_sample: True
+num_diffusion_step: 1000
+num_sampling_step: 100
+diffusion_objective: pred_v
+learn_variance: True
+sigma_small: True
+beta_schedule_type: cosine
+ddim_sampling_eta: 0.0
+
+# training setting
+num_train_step: 20000
+save_and_sample_every: 5000
+val_every: 1000
+num_sample: 512
+val_batch_size: 128
+train_batch_size: 128
+train_lr: 0.0001
+adam_betas: [0.9, 0.999]
+gradient_accumulate_every: 1
+ema_update_every: 5
+ema_decay: 0.9999
+amp: True
+mixed_precision_type: fp16
+split_batches: True
+log_wandb: False

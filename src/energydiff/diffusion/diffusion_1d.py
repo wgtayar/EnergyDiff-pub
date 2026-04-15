@@ -6,6 +6,7 @@ from multiprocessing import cpu_count
 from random import random
 from functools import partial
 from typing import Optional, Any, Optional, Callable, Sequence, Iterable
+import logging
 from .typing import Float, Data1D, Int
 
 import torch
@@ -24,7 +25,10 @@ from accelerate import Accelerator
 from ema_pytorch import EMA
 
 from tqdm.auto import tqdm
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from .version import __version__
 from .rectified_flow import RectifiedFlow
@@ -1005,6 +1009,7 @@ class Trainer1D():
         adam_betas: tuple[float, float] = (0.9, 0.999),
         save_and_sample_every: int = 1000,
         val_every: int|None = None,
+        heavy_eval_every: int|None = None,
         max_val_batch: int = 10,
         num_sample: int = 25, # num_sample at milestone
         result_folder: str = './results',
@@ -1021,6 +1026,7 @@ class Trainer1D():
         log_wandb: bool = False,
         log_id: str = 'train-diffusion',
         distribute_ema: bool = False, 
+        checkpoint_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         super().__init__()
         
@@ -1042,6 +1048,7 @@ class Trainer1D():
         self.num_sample = num_sample
         self.save_and_sample_every = save_and_sample_every
         self.val_every = default(val_every, save_and_sample_every)
+        self.heavy_eval_every = default(heavy_eval_every, save_and_sample_every)
         self.max_val_batch = max_val_batch
         
         self.batch_size = train_batch_size
@@ -1064,7 +1071,7 @@ class Trainer1D():
         self.val_loader = DataLoader(
             val_dataset,
             batch_size=self.val_batch_size,
-            shuffle=True,
+            shuffle=False,
             pin_memory=True,
             num_workers=num_dataloader_workers,
             persistent_workers=True,
@@ -1122,10 +1129,11 @@ class Trainer1D():
                     self.sample_fn = _sample_fn
                
         self.result_folder = Path(result_folder)
-        self.result_folder.mkdir(exist_ok=True)
+        self.result_folder.mkdir(parents=True, exist_ok=True)
         
         self.log_wandb = log_wandb
         self.log_id = log_id
+        self.checkpoint_callback = checkpoint_callback
         
         # step counter
         self.step = 0
@@ -1159,6 +1167,7 @@ class Trainer1D():
             adam_betas = config.adam_betas,
             save_and_sample_every = config.save_and_sample_every,
             val_every = config.val_every,
+            heavy_eval_every = config.heavy_eval_every,
             num_sample = config.val_sample_config.num_sample,
             amp = config.amp,
             mixed_precision_type = config.mixed_precision_type,
@@ -1176,7 +1185,7 @@ class Trainer1D():
     
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
-            return
+            return None
 
         to_save = {
             'step': self.step,
@@ -1188,7 +1197,9 @@ class Trainer1D():
             'version': __version__
         }
         
-        torch.save(to_save, os.path.join(self.result_folder, self.log_id+'-'+f'model-{milestone}.pt'))
+        save_path = os.path.join(self.result_folder, self.log_id+'-'+f'model-{milestone}.pt')
+        torch.save(to_save, save_path)
+        return Path(save_path)
     
     def load_model(self, milestone, directory = None, log_id = None, ignore_init_final = False):
         "load from a milestone, but only load the model & ema model"
@@ -1287,6 +1298,37 @@ class Trainer1D():
         for fn_name in dict_eval_fn:
             result[fn_name] = result[fn_name] / count_sample
         return result
+
+    @torch.no_grad()
+    def estimate_validation_loss(self, max_val_batch: int | None = None) -> float | None:
+        if self.val_loader is None:
+            return None
+        model = self.accelerator.unwrap_model(self.model)
+        was_training = model.training
+        model.eval()
+        total_loss = 0.0
+        total_count = 0
+        max_batch = self.max_val_batch if max_val_batch is None else max_val_batch
+
+        for batch_index, (val_target, val_cond) in enumerate(self.val_loader):
+            if max_batch is not None and batch_index >= max_batch:
+                break
+            val_target = val_target.to(self.device)
+            val_cond = val_cond.to(self.device)
+            model_kwargs = {
+                'c': val_cond,
+                'cfg_scale': 1.,
+            }
+            loss_terms = model(val_target, model_kwargs=model_kwargs)
+            batch_loss = float(loss_terms['loss'].item())
+            total_loss += batch_loss * int(val_target.shape[0])
+            total_count += int(val_target.shape[0])
+
+        if was_training:
+            model.train()
+        if total_count == 0:
+            return None
+        return total_loss / total_count
             
     def train(self):
         accelerator = self.accelerator
@@ -1328,7 +1370,7 @@ class Trainer1D():
                 accelerator.clip_grad_norm_(self.model.parameters(), 1.)
                 pbar.set_description(f'loss: {total_loss:.4f}')
                 
-                if self.log_wandb and self.accelerator.is_main_process:
+                if self.log_wandb and wandb is not None and self.accelerator.is_main_process:
                     try:
                         wandb.log({'Train': {
                                 'Train Loss': total_loss,
@@ -1363,6 +1405,7 @@ class Trainer1D():
                             ))
                             
                         all_sample = torch.cat(list_all_sample, dim=0)
+                        validation_loss = self.estimate_validation_loss(max_val_batch=self.max_val_batch)
                         val_result = self.validate(
                             all_sample,
                             val_loader=self.val_loader,
@@ -1370,7 +1413,7 @@ class Trainer1D():
                             pre_eval_fn=self.pre_eval_fn,
                             max_val_batch=self.max_val_batch,
                         )
-                        if self.log_wandb:
+                        if self.log_wandb and wandb is not None:
                             wandb.log({'Validation': val_result}, step=self.step)
                             # plt.plot(all_sample.squeeze(1).cpu().numpy())
                             wandb.log({'Samples': all_sample.squeeze(1)}, step=self.step)
@@ -1379,13 +1422,42 @@ class Trainer1D():
                             _all_target = self.val_loader.dataset.tensor # not a very good way to get target
                             wandb.log({'Target Histogram': wandb.Histogram(_all_target[:,mid_channel,:].cpu().flatten(), num_bins=200)}, step=self.step)
                         
-                        if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                        sample_path = None
+                        checkpoint_path = None
+                        is_save_event = self.step != 0 and self.step % self.save_and_sample_every == 0
+                        is_heavy_event = self.step != 0 and self.step % self.heavy_eval_every == 0
+                        event_type = 'heavy' if (is_heavy_event or is_save_event) else 'light'
+                        if is_save_event:
                             milestone = self.step // self.save_and_sample_every
                             # save sample
-                            torch.save(all_sample,
-                                    os.path.join(self.result_folder, self.log_id+'-'+f'sample-{milestone}.pt'))
+                            sample_path = Path(os.path.join(self.result_folder, self.log_id+'-'+f'sample-{milestone}.pt'))
+                            torch.save(all_sample, sample_path)
                             # save states
-                            self.save(milestone)
+                            checkpoint_path = self.save(milestone)
+                        if self.checkpoint_callback is not None:
+                            self.checkpoint_callback(
+                                {
+                                    'step': self.step,
+                                    'event_type': event_type,
+                                    'train_loss': float(total_loss),
+                                    'train_mse': float(total_mse),
+                                    'train_vb': float(total_vb),
+                                    'validation_loss': validation_loss,
+                                    'generated_sample': all_sample.detach().cpu(),
+                                    'validation_metrics': val_result,
+                                    'checkpoint_path': str(checkpoint_path) if checkpoint_path is not None else '',
+                                    'sample_path': str(sample_path) if sample_path is not None else '',
+                                    'milestone': self.step // self.save_and_sample_every if is_save_event else '',
+                                }
+                            )
+                        logging.getLogger(__name__).info(
+                            "Checkpoint event step=%s type=%s validation_loss=%s checkpoint=%s sample=%s",
+                            self.step,
+                            event_type,
+                            validation_loss if validation_loss is not None else 'NA',
+                            checkpoint_path or '-',
+                            sample_path or '-',
+                        )
                         
                 pbar.update(1)
                 
