@@ -9,11 +9,15 @@ import string
 import torch
 import numpy as np
 import pytorch_lightning as pl
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from energydiff.diffusion import LossType, BetaScheduleType, ModelMeanType, ModelVarianceType
 from energydiff.diffusion import Transformer1D, Unet1D, SpacedDiffusion1D, IntegerEmbedder, EmbedderWrapper, Zeros, DenoisingMLP1D
 from energydiff.diffusion import space_timesteps
+from energydiff.diffusion.diffusion_1d import create_backbone
 from energydiff.diffusion.rectified_flow import RectifiedFlow, RFPredictionType, RFScheduleType
 from energydiff.dataset import NAME_SEASONS, TimeSeriesDataset, WPuQ, WPuQTrafo, WPuQPV, LCLElectricityProfile, CoSSMic, all_dataset, WPUQ_PV_DIRECTION_CODE
 
@@ -35,7 +39,7 @@ class WandbArtifactCleanerAlternative(pl.Callback):
         super().__init__()
         
     def on_validation_end(self, trainer, pl_module):
-        if not wandb.run:
+        if wandb is None or not wandb.run:
             return
         
         api = wandb.Api()
@@ -63,7 +67,7 @@ class WandbArtifactCleaner(pl.Callback):
         self.keep_n_latest = keep_n_latest
         
     def on_validation_end(self, trainer, pl_module):
-        if not wandb.run:
+        if wandb is None or not wandb.run:
             return
             
         api = wandb.Api()
@@ -96,7 +100,7 @@ class WandbArtifactCleaner(pl.Callback):
 
 class WandbModelLogger(pl.Callback):
     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
-        if not wandb.run:
+        if wandb is None or not wandb.run:
             return
             
         # Create a temporary file to save the checkpoint
@@ -131,6 +135,8 @@ def create_wandb_logger(config: ExperimentConfig, run_id: str) -> pl.loggers.Wan
     r"""
     Setup and init the wandb logger.
     """
+    if wandb is None:
+        raise ImportError('wandb is required for create_wandb_logger but is not installed.')
     wandb_logger = pl.loggers.WandbLogger(
         project={
             'wpuq': 'HeatDDPM',
@@ -479,13 +485,17 @@ def get_task_profile_condition(dataset: TimeSeriesDataset, **kwargs):
             else:
                 raise RuntimeError(f'Unknown direction {direction}. Must be one of {WPUQ_PV_DIRECTION_CODE.keys()} or "all_directions"')
     elif isinstance(dataset, LCLElectricityProfile):
-        use_fraction = kwargs.get('lcl_use_fraction', 0.01)
+        use_fraction = float(kwargs.get('lcl_use_fraction', 1.0))
+        if not (0 < use_fraction <= 1.0):
+            raise ValueError(f'lcl_use_fraction must be in (0, 1], got {use_fraction}')
         for task in final_profile.keys():
-            indices = np.random.choice(
-                len(dataset.dataset.profile[task]), 
-                int(len(dataset.dataset.profile[task]) * use_fraction), 
-                replace=False
-            )
+            num_profile = len(dataset.dataset.profile[task])
+            if use_fraction >= 1.0:
+                indices = np.arange(num_profile)
+            else:
+                num_keep = max(1, int(round(num_profile * use_fraction)))
+                rng = np.random.default_rng(0)
+                indices = np.sort(rng.choice(num_profile, num_keep, replace=False))
             final_profile[task] = dataset.dataset.profile[task][indices]
             # label shape: (N, d, 1) where d is the dimension of the label
             final_condition[task] = {
@@ -573,13 +583,17 @@ def get_generated_filename(exp_config: ExperimentConfig, model: str, gmm_num_com
     " filename = {model related} + {dataset related} + {resolution season} + {sampling related}"
     # assert model in ['copula', 'gmm', 'ddpm', 'ddpm-calibrated']
     filename = ''
+    sample_run_id = (
+        exp_config.model.load_time_id
+        or exp_config.time_id
+    )
     # model related
     if model == 'copula':
         filename += 'copula'
     elif model == 'gmm':
         filename += f'gmm_{gmm_num_components}_components'
     elif model in ['ddpm','ddpm-calibrated']:
-        filename += f'{model}_{exp_config.model.load_time_id}'
+        filename += f'{model}_{sample_run_id}'
     else:
         filename += f'{model}'
         # raise ValueError(f'Unknown model {model}')

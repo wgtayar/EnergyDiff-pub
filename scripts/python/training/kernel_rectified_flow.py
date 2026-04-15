@@ -1,5 +1,4 @@
 from datetime import datetime
-import random
 import os
 from multiprocessing import cpu_count
 from copy import deepcopy
@@ -19,6 +18,7 @@ from energydiff.utils.eval import MkMMD, source_mean, source_std, target_mean, t
     ks_test_d, ks_test_p, UMAPEvalCollection, get_mapper_label, calculate_frechet
 
 from energydiff.utils.argument_parser import argument_parser
+from energydiff.utils import generate_time_id
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -26,7 +26,7 @@ def count_parameters(model):
 def main():
     config = argument_parser()
     exp_id = config.exp_id
-    time_id = datetime.now().strftime("%Y%m%d" + "-" + f"{random.randint(0, 9999):04d}")
+    time_id = generate_time_id()
     # Step -1: Parse arguments
     data_root = config.data.root
     train_season = config.data.train_season

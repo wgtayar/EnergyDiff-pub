@@ -77,6 +77,7 @@ class DataConfig(BaseConfig):
     train_season: str
     val_season: str
     target_labels: str
+    lcl_use_fraction: float = 0.01
     scaling_factor: list[float]|None = None
     
 @dataclass
@@ -101,6 +102,15 @@ class ModelConfig(BaseConfig):
     load_milestone: int|None = None
     resume: bool = False
     freeze_layers: bool = False
+    num_parameter: int|None = None
+
+    @property
+    def load_runid(self) -> str|None:
+        return self.load_time_id
+
+    @load_runid.setter
+    def load_runid(self, value: str|None) -> None:
+        self.load_time_id = value
     
 @dataclass
 class TransformerConfig(ModelConfig):
@@ -173,7 +183,10 @@ class TrainConfig(BaseConfig):
     num_train_step: int = 50000
     save_and_sample_every: int = 50000
     val_every: int = 1250
+    heavy_eval_every: int|None = None
     val_batch_size: int = 256
+    diagnostic_test_metrics: bool = False
+    save_plots_on_heavy_eval: bool = False
     
     subconfigs = {'val_sample_config': SampleConfig}
     
@@ -192,6 +205,11 @@ class ExperimentConfig(BaseConfig):
     diffusion: DDPMConfig
     train: TrainConfig
     sample: SampleConfig
+    experiment_slug: str|None = None
+    dataset_key: str|None = None
+    family_filter: str|None = None
+    run_root: str|None = None
+    artifact_root: str = '.'
     log_wandb: bool = False
     time_id: str|None = None
     wandb_id: str|None = None # None: no wandb logging or has not been initialized

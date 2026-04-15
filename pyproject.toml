@@ -7,7 +7,16 @@ dependencies = [
     "torch",
     "accelerate",
     "ema-pytorch",
-    "umap-learn"
+    "einops",
+    "matplotlib",
+    "pandas",
+    "pytorch-lightning",
+    "PyYAML",
+    "scipy",
+    "torchmetrics",
+    "tqdm",
+    "umap-learn",
+    "wandb"
 ]
 [tool.setuptools]
 package-dir = {"" = "src"}

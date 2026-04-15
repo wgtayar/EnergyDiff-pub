@@ -1,6 +1,7 @@
 from functools import partial
 from argparse import ArgumentParser, Namespace
 import os
+from pathlib import Path
 import yaml
 import warnings
 
@@ -55,6 +56,7 @@ def argument_parser() -> configuration.ExperimentConfig:
     parser.add_argument('--train_season', default='winter', type=str, help='season of training data, winter/spring/.../whole_year')
     parser.add_argument('--val_season', default='winter', type=str, help='season of validation data, winter/spring/.../whole_year')
     parser.add_argument('--val_area', default='all', type=str, help='area of validation data, industrial/residential/public')
+    parser.add_argument('--lcl_use_fraction', default=0.01, type=float, help='fraction of lcl_electricity samples to use')
     parser.add_argument('--load_data', default=True, type=str2bool, help='whether to load processed data')
     parser.add_argument('--normalize_data', default=True, type=str2bool, help='whether to normalize data')
     parser.add_argument('--pit_data', default=False, type=str2bool, help='whether to PIT data')
@@ -117,14 +119,22 @@ def argument_parser() -> configuration.ExperimentConfig:
     parser.add_argument('--num_train_step', default=5000, type=int, help='number of training steps')
     parser.add_argument('--save_and_sample_every', default=500, type=int, help='save and sample every n steps')
     parser.add_argument('--val_every', default=1000, type=int, help='validate every n steps. save_and_sample_every must be a multiple of val_every')
+    parser.add_argument('--heavy_eval_every', default=None, type=int, help='run heavyweight checkpoint evaluation every n steps')
     parser.add_argument('--num_sample', default=25, type=int, help='number of samples to generate every n steps')
     parser.add_argument('--log_wandb', default=True, type=str2bool, help='whether to log to wandb')
+    parser.add_argument('--artifact_root', default='.', type=str, help='root directory for configs, checkpoints, samples, and logs')
+    parser.add_argument('--experiment_slug', default=None, type=str, help='experiment slug used for run folder naming')
+    parser.add_argument('--dataset_key', default=None, type=str, help='dataset key used for manifests')
+    parser.add_argument('--family_filter', default=None, type=str, help='dataset family filter used for manifests')
+    parser.add_argument('--run_root', default=None, type=str, help='explicit run root for config, logs, checkpoints, samples, and eval outputs')
+    parser.add_argument('--diagnostic_test_metrics', default=False, type=str2bool, help='whether checkpoint instrumentation should log test metrics as diagnostic-only')
+    parser.add_argument('--save_plots_on_heavy_eval', default=False, type=str2bool, help='whether checkpoint instrumentation should save plots on heavy eval events')
     
     # Sample and test Parameters
     parser.add_argument('--val_batch_size', default=None, type=int, help='batch size for validation/testing')
     parser.add_argument('--set_time_id', default=None, type=str, help='manually set a time id to start')
     parser.add_argument('--load_time_id', default=None, type=str, help='time id to load from')
-    parser.add_argument('--load_milestone', default=10, type=int, help='milestone to load')
+    parser.add_argument('--load_milestone', default=None, type=int, help='milestone to load')
     parser.add_argument('--resume', default=False, action='store_true', help='whether to resume training from a milestone')
     parser.add_argument('--freeze_layers', default=False, action='store_true', help='whether to freeze layers of transformer')
     
@@ -180,7 +190,8 @@ def argument_parser() -> configuration.ExperimentConfig:
         vectorize_window_size=args.vectorize_window_size,
         train_season=args.train_season,
         val_season=args.val_season,
-        target_labels=args.target_labels
+        target_labels=args.target_labels,
+        lcl_use_fraction=args.lcl_use_fraction,
     )
     if args.dataset == 'cossmic':
         data_config = configuration.CossmicDataConfig.inherit(
@@ -256,7 +267,10 @@ def argument_parser() -> configuration.ExperimentConfig:
         num_train_step=args.num_train_step,
         save_and_sample_every=args.save_and_sample_every,
         val_every=args.val_every,
+        heavy_eval_every=args.heavy_eval_every,
         val_batch_size=args.val_batch_size,
+        diagnostic_test_metrics=args.diagnostic_test_metrics,
+        save_plots_on_heavy_eval=args.save_plots_on_heavy_eval,
     )
     
     # 2.5 final sample config
@@ -276,6 +290,11 @@ def argument_parser() -> configuration.ExperimentConfig:
         diffusion=diffusion_config,
         train=train_config,
         sample=final_sample_config,
+        experiment_slug=args.experiment_slug,
+        dataset_key=args.dataset_key,
+        family_filter=args.family_filter,
+        run_root=args.run_root,
+        artifact_root=args.artifact_root,
         log_wandb=args.log_wandb,
         time_id=args.set_time_id # str|None
     )
@@ -284,8 +303,11 @@ def argument_parser() -> configuration.ExperimentConfig:
 
 def save_config(exp_config: configuration.ExperimentConfig, time_id: str) -> None:
     "save config to yaml"
-    os.makedirs('results/configs', exist_ok=True)
-    exp_config.to_yaml(f'results/configs/exp_config_{time_id}.yaml')
+    config_root = exp_config.run_root or exp_config.artifact_root
+    config_dir = os.path.join(config_root, 'config')
+    os.makedirs(config_dir, exist_ok=True)
+    exp_config.time_id = time_id
+    exp_config.to_yaml(os.path.join(config_dir, f'exp_config_{time_id}.yaml'))
     
 def inference_parser() -> configuration.ExperimentConfig:
     r"""Fast way to parse arguments for inference
@@ -308,19 +330,29 @@ def inference_parser() -> configuration.ExperimentConfig:
         description='load and inference diffusion. '
     )
     parser.add_argument('--load_time_id', type=str, help='time id to load')
-    # parser.add_argument('--load_milestone', required=True, type=int, help='milestone to load')
+    parser.add_argument('--load_milestone', default=None, type=int, help='milestone to load')
     parser.add_argument('--val_batch_size', default=None, type=int, help='batch size for validation/testing')
     parser.add_argument('--num_sample', default=None, type=int, help='number of samples to generate every n steps')
     parser.add_argument('--num_sampling_step', default=None, type=int, help='number of sampling steps')
     parser.add_argument('--dpm_solver_sample', default=None, type=str2bool, help='whether to use dpm solver for sampling')
+    parser.add_argument('--artifact_root', default='.', type=str, help='root directory for configs, checkpoints, samples, and logs')
+    parser.add_argument('--run_root', default=None, type=str, help='run root containing config/checkpoints/samples/logs')
     
     args, _ = parser.parse_known_args()
     
     # load training config
-    exp_config = configuration.ExperimentConfig.from_yaml(f'results/configs/exp_config_{args.load_time_id}.yaml')
-    
+    config_path = (
+        Path(args.run_root) / 'config' / f'exp_config_{args.load_time_id}.yaml'
+        if args.run_root is not None
+        else Path(args.artifact_root) / 'results' / 'configs' / f'exp_config_{args.load_time_id}.yaml'
+    )
+    exp_config = configuration.ExperimentConfig.from_yaml(str(config_path))
+
     exp_config.model.load_time_id = args.load_time_id
-    # exp_config.model.load_milestone = args.load_milestone
+    exp_config.artifact_root = args.artifact_root
+    exp_config.run_root = args.run_root
+    if args.load_milestone is not None:
+        exp_config.model.load_milestone = args.load_milestone
     if args.val_batch_size is not None:
         exp_config.sample.val_batch_size = args.val_batch_size
     if args.num_sample is not None:
