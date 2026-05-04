@@ -3,13 +3,16 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 from functools import partial
+import json
 import logging
 from multiprocessing import cpu_count
 import os
 from pathlib import Path
+import shutil
 import sys
 
 import torch
+import pandas as pd
 try:
     import wandb
 except ImportError:
@@ -20,8 +23,9 @@ DATA_SRC_DIR = REPO_ROOT / "src" / "data"
 if str(DATA_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(DATA_SRC_DIR))
 
-from daily_profile_metrics import compact_metrics, evaluate_daily_profile_bundle, flatten_sample_tensor, load_daily_csv, maybe_denormalize
+from daily_profile_metrics import compact_metrics, evaluate_daily_profile_bundle, flatten_sample_tensor, load_daily_csv, maybe_denormalize, resolve_scaling_context
 from experiment_layout import append_records, ensure_run_layout, merge_run_manifest, write_run_manifest
+from industrial_scorecard import build_industrial_checkpoint_scorecard
 
 from energydiff.dataset import NAME_SEASONS, PIT, standard_normal_cdf, standard_normal_icdf
 from energydiff.diffusion import Trainer1D
@@ -73,9 +77,70 @@ def absolutize_config_paths(config) -> None:
         config.run_root = str(Path(config.run_root).expanduser().resolve())
 
 
-def build_run_manifest(config, run_id: str, run_layout, log_path: Path) -> dict:
+def load_dataset_export_manifest(dataset_root: Path) -> dict | None:
+    manifest_path = dataset_root / "manifests" / "dataset_manifest.json"
+    if not manifest_path.exists():
+        return None
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def build_run_config_summary(config) -> dict:
     return {
-        "schema_version": 1,
+        "dataset": {
+            "dataset": config.data.dataset,
+            "dataset_key": config.dataset_key,
+            "family_filter": config.family_filter,
+            "resolution": config.data.resolution,
+            "normalize": config.data.normalize,
+            "pit": config.data.pit,
+            "vectorize": config.data.vectorize,
+            "style_vectorize": config.data.style_vectorize,
+            "vectorize_window_size": config.data.vectorize_window_size,
+            "lcl_use_fraction": config.data.lcl_use_fraction,
+            "train_season": config.data.train_season,
+            "val_season": config.data.val_season,
+        },
+        "model": {
+            "model_class": config.model.model_class,
+            "conditioning": config.model.conditioning,
+            "dim_base": config.model.dim_base,
+            "dropout": config.model.dropout,
+            "num_attn_head": config.model.num_attn_head,
+            "num_encoder_layer": getattr(config.model, "num_encoder_layer", None),
+            "num_decoder_layer": getattr(config.model, "num_decoder_layer", None),
+            "dim_feedforward": config.model.dim_feedforward,
+            "learn_variance": config.model.learn_variance,
+        },
+        "training": {
+            "num_train_step": config.train.num_train_step,
+            "train_batch_size": config.train.batch_size,
+            "val_batch_size": config.train.val_batch_size,
+            "train_lr": config.train.lr,
+            "save_and_sample_every": config.train.save_and_sample_every,
+            "val_every": config.train.val_every,
+            "heavy_eval_every": config.train.heavy_eval_every,
+            "diagnostic_test_metrics": config.train.diagnostic_test_metrics,
+            "save_best_checkpoint": config.train.save_best_checkpoint,
+            "best_checkpoint_metric": config.train.best_checkpoint_metric,
+            "best_checkpoint_filename": config.train.best_checkpoint_filename,
+            "best_checkpoint_meta_filename": config.train.best_checkpoint_meta_filename,
+        },
+        "sampling": {
+            "num_sample": config.sample.num_sample,
+            "num_sampling_step": config.sample.num_sampling_step,
+            "dpm_solver_sample": config.sample.dpm_solver_sample,
+        },
+    }
+
+
+def build_run_manifest(config, run_id: str, run_layout, log_path: Path) -> dict:
+    best_checkpoint_path = None
+    best_checkpoint_meta_path = None
+    if config.train.save_best_checkpoint:
+        best_checkpoint_path = str(run_layout.checkpoints_dir / config.train.best_checkpoint_filename)
+        best_checkpoint_meta_path = str(run_layout.checkpoints_dir / config.train.best_checkpoint_meta_filename)
+    return {
+        "schema_version": 2,
         "run_id": run_id,
         "experiment_slug": config.experiment_slug,
         "dataset_key": config.dataset_key,
@@ -87,12 +152,15 @@ def build_run_manifest(config, run_id: str, run_layout, log_path: Path) -> dict:
             "training": "running",
             "evaluation": "pending",
         },
+        "config_summary": build_run_config_summary(config),
         "instrumentation": {
             "light_eval_every": config.train.val_every,
             "heavy_eval_every": config.train.heavy_eval_every,
             "save_and_sample_every": config.train.save_and_sample_every,
             "diagnostic_test_metrics": config.train.diagnostic_test_metrics,
             "save_plots_on_heavy_eval": config.train.save_plots_on_heavy_eval,
+            "save_best_checkpoint": config.train.save_best_checkpoint,
+            "best_checkpoint_metric": config.train.best_checkpoint_metric,
         },
         "paths": {
             "config_dir": str(run_layout.config_dir),
@@ -106,13 +174,228 @@ def build_run_manifest(config, run_id: str, run_layout, log_path: Path) -> dict:
             "checkpoint_metrics_csv": str(run_layout.manifests_dir / "checkpoint_metrics.csv"),
             "checkpoint_local_metrics_csv": str(run_layout.manifests_dir / "checkpoint_local_metrics.csv"),
             "checkpoint_artifacts_csv": str(run_layout.manifests_dir / "checkpoint_artifacts.csv"),
+            "best_checkpoint_path": best_checkpoint_path,
+            "best_checkpoint_meta_path": best_checkpoint_meta_path,
         },
         "artifacts": {
             "final_sample": None,
             "latest_checkpoint": None,
             "latest_checkpoint_sample": None,
+            "best_checkpoint": {
+                "path": best_checkpoint_path,
+                "meta_path": best_checkpoint_meta_path,
+                "criterion": config.train.best_checkpoint_metric if config.train.save_best_checkpoint else None,
+                "selected_step": None,
+                "selected_checkpoint_path": None,
+            },
         },
+        "dataset": {},
+        "model": {},
     }
+
+
+def _stringify_path(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() == "nan":
+        return ""
+    return text
+
+
+def _json_safe_value(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    if pd.isna(value):
+        return None
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _json_safe_mapping(record: dict) -> dict:
+    return {str(key): _json_safe_value(value) for key, value in record.items()}
+
+
+def select_best_checkpoint_candidate(
+    checkpoint_metrics_path: Path,
+    *,
+    best_checkpoint_metric: str,
+) -> tuple[dict | None, dict]:
+    if not checkpoint_metrics_path.exists():
+        return None, {}
+
+    checkpoint_metrics = pd.read_csv(checkpoint_metrics_path)
+    if checkpoint_metrics.empty:
+        return None, {}
+
+    if best_checkpoint_metric == "validation_loss":
+        eligible = checkpoint_metrics.loc[
+            checkpoint_metrics["validation_loss"].notna()
+            & checkpoint_metrics["checkpoint_path"].map(lambda value: _stringify_path(value) != "")
+        ].copy()
+        if eligible.empty:
+            return None, {}
+        eligible = eligible.sort_values(["validation_loss", "step"], ascending=[True, True])
+        row = eligible.iloc[0].to_dict()
+        return (
+            {
+                "row": row,
+                "source_checkpoint_path": _stringify_path(row.get("checkpoint_path")),
+                "source_sample_path": _stringify_path(row.get("sample_path")),
+                "selection_value": float(row["validation_loss"]),
+                "selection_value_key": "validation_loss",
+                "selection_label": "validation loss",
+                "selection_signal": "validation loss on saved checkpoints",
+                "selection_mode": "validation_led",
+                "diagnostic_only": False,
+                "metrics": _json_safe_mapping(row),
+            },
+            {},
+        )
+
+    if best_checkpoint_metric == "industrial_val_score":
+        checkpoint_scorecard = build_industrial_checkpoint_scorecard(checkpoint_metrics)
+        if checkpoint_scorecard.empty:
+            return None, {}
+        eligible = checkpoint_scorecard.loc[
+            checkpoint_scorecard["val_industrial_rank_score"].notna()
+            & checkpoint_scorecard["checkpoint_path"].map(lambda value: _stringify_path(value) != "")
+        ].copy()
+        if eligible.empty:
+            return None, {}
+        eligible = eligible.sort_values(["val_industrial_rank_score", "step"], ascending=[True, True])
+        row = eligible.iloc[0].to_dict()
+        return (
+            {
+                "row": row,
+                "source_checkpoint_path": _stringify_path(row.get("checkpoint_path")),
+                "source_sample_path": _stringify_path(row.get("sample_path")),
+                "selection_value": float(row["val_industrial_rank_score"]),
+                "selection_value_key": "val_industrial_rank_score",
+                "selection_label": "validation industrial weighted rank score",
+                "selection_signal": "validation industrial weighted rank score on saved heavy checkpoints",
+                "selection_mode": "validation_led",
+                "diagnostic_only": False,
+                "metrics": _json_safe_mapping(row),
+            },
+            {"checkpoint_scorecard": checkpoint_scorecard},
+        )
+
+    raise ValueError(f"Unsupported best_checkpoint_metric={best_checkpoint_metric}")
+
+
+def maybe_update_best_checkpoint_artifact(
+    *,
+    run_id: str,
+    run_layout,
+    config,
+    logger: logging.Logger,
+    checkpoint_metrics_path: Path,
+) -> dict | None:
+    if not config.train.save_best_checkpoint:
+        return None
+
+    selected, diagnostics = select_best_checkpoint_candidate(
+        checkpoint_metrics_path,
+        best_checkpoint_metric=config.train.best_checkpoint_metric,
+    )
+    if selected is None:
+        logger.info(
+            "Best-checkpoint selection skipped: criterion=%s has no eligible saved checkpoint yet.",
+            config.train.best_checkpoint_metric,
+        )
+        return None
+
+    source_checkpoint_path = Path(selected["source_checkpoint_path"])
+    if not source_checkpoint_path.exists():
+        logger.warning("Best-checkpoint source path does not exist yet: %s", source_checkpoint_path)
+        return None
+
+    best_checkpoint_path = run_layout.checkpoints_dir / config.train.best_checkpoint_filename
+    best_checkpoint_meta_path = run_layout.checkpoints_dir / config.train.best_checkpoint_meta_filename
+    existing_meta = {}
+    if best_checkpoint_meta_path.exists():
+        try:
+            existing_meta = json.loads(best_checkpoint_meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing_meta = {}
+
+    selected_step = int(_json_safe_value(selected["row"].get("step")))
+    selected_checkpoint_path = str(source_checkpoint_path)
+    if (
+        existing_meta.get("selected_step") == selected_step
+        and existing_meta.get("selected_checkpoint_path") == selected_checkpoint_path
+        and best_checkpoint_path.exists()
+    ):
+        return existing_meta
+
+    shutil.copy2(source_checkpoint_path, best_checkpoint_path)
+    metadata = {
+        "schema_version": 1,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "run_id": run_id,
+        "experiment_slug": config.experiment_slug,
+        "dataset_key": config.dataset_key,
+        "family_filter": config.family_filter,
+        "selected_step": selected_step,
+        "selected_milestone": _json_safe_value(selected["row"].get("milestone")),
+        "selected_checkpoint_path": selected_checkpoint_path,
+        "selected_sample_path": selected["source_sample_path"] or None,
+        "saved_artifact_path": str(best_checkpoint_path),
+        "selection_criterion": selected["selection_value_key"],
+        "selection_label": selected["selection_label"],
+        "selection_signal": selected["selection_signal"],
+        "selection_value": float(selected["selection_value"]),
+        "validation_led": True,
+        "diagnostic_only": bool(selected["diagnostic_only"]),
+        "metric_values": selected["metrics"],
+    }
+    if "checkpoint_scorecard" in diagnostics:
+        metadata["selection_reference"] = {
+            "checkpoint_metrics_csv": str(checkpoint_metrics_path),
+            "criterion": config.train.best_checkpoint_metric,
+        }
+    best_checkpoint_meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    merge_run_manifest(
+        run_layout.root,
+        {
+            "artifacts": {
+                "best_checkpoint": {
+                    "path": str(best_checkpoint_path),
+                    "meta_path": str(best_checkpoint_meta_path),
+                    "criterion": config.train.best_checkpoint_metric,
+                    "selected_step": selected_step,
+                    "selected_checkpoint_path": selected_checkpoint_path,
+                }
+            },
+            "selection": {
+                "best_training_checkpoint": {
+                    "criterion": config.train.best_checkpoint_metric,
+                    "selection_signal": selected["selection_signal"],
+                    "selection_value": float(selected["selection_value"]),
+                    "selected_step": selected_step,
+                    "selected_checkpoint_path": selected_checkpoint_path,
+                    "validation_led": True,
+                    "diagnostic_only": bool(selected["diagnostic_only"]),
+                }
+            },
+        },
+    )
+    logger.info(
+        "Best checkpoint updated: criterion=%s step=%s source=%s target=%s",
+        config.train.best_checkpoint_metric,
+        selected_step,
+        source_checkpoint_path,
+        best_checkpoint_path,
+    )
+    return metadata
 
 
 def build_checkpoint_callback(
@@ -120,6 +403,7 @@ def build_checkpoint_callback(
     run_id: str,
     run_layout,
     config,
+    checkpoint_scaling_factor,
     logger: logging.Logger,
     reference_df,
     reference_profiles,
@@ -157,7 +441,11 @@ def build_checkpoint_callback(
     def _callback(payload: dict) -> None:
         step = int(payload["step"])
         event_type = str(payload["event_type"])
-        synthetic_profiles = maybe_denormalize(flatten_sample_tensor(payload["generated_sample"]), config)
+        synthetic_profiles = maybe_denormalize(
+            flatten_sample_tensor(payload["generated_sample"]),
+            config,
+            scaling_factor=checkpoint_scaling_factor,
+        )
         save_plots = bool(config.train.save_plots_on_heavy_eval and event_type == "heavy")
         checkpoint_plot_dir = run_layout.plots_dir / "checkpoints" / f"step_{step:06d}" if save_plots else None
 
@@ -221,6 +509,14 @@ def build_checkpoint_callback(
         if local_rows:
             append_records(checkpoint_local_metrics_path, local_rows)
 
+        best_checkpoint_metadata = maybe_update_best_checkpoint_artifact(
+            run_id=run_id,
+            run_layout=run_layout,
+            config=config,
+            logger=logger,
+            checkpoint_metrics_path=checkpoint_metrics_path,
+        )
+
         if payload["checkpoint_path"] or payload["sample_path"]:
             merge_run_manifest(
                 run_layout.root,
@@ -230,6 +526,14 @@ def build_checkpoint_callback(
                         "latest_checkpoint_sample": payload["sample_path"] or None,
                     }
                 },
+            )
+
+        if best_checkpoint_metadata is not None:
+            logger.info(
+                "Best validation checkpoint artifact: step=%s criterion=%s path=%s",
+                best_checkpoint_metadata.get("selected_step"),
+                best_checkpoint_metadata.get("selection_criterion"),
+                best_checkpoint_metadata.get("saved_artifact_path"),
             )
 
         logger.info(
@@ -324,6 +628,13 @@ def main():
         write_run_manifest(run_layout.root, run_manifest)
 
     dataset_root = Path(config.data.root).resolve()
+    dataset_export_manifest = load_dataset_export_manifest(dataset_root)
+    if dataset_export_manifest is not None:
+        logger.info("Dataset export manifest: %s", dataset_root / "manifests" / "dataset_manifest.json")
+        if dataset_export_manifest.get("export_fingerprint") is not None:
+            logger.info("Dataset export fingerprint: %s", dataset_export_manifest["export_fingerprint"])
+        if dataset_export_manifest.get("scaling") is not None:
+            logger.info("Dataset export scaling: %s", dataset_export_manifest["scaling"])
     reference_df, reference_profiles = load_daily_csv(dataset_root / "raw" / "lcl_electricity_train.csv")
     val_df, val_profiles = load_daily_csv(dataset_root / "raw" / "lcl_electricity_val.csv")
     test_df, test_profiles = load_daily_csv(dataset_root / "raw" / "lcl_electricity_test.csv")
@@ -452,6 +763,11 @@ def main():
         run_id=time_id,
         run_layout=run_layout,
         config=config,
+        checkpoint_scaling_factor=resolve_scaling_context(
+            config=config,
+            dataset_manifest=dataset_export_manifest,
+            dataset_root=dataset_root,
+        )["selected_scaling_factor"],
         logger=logger,
         reference_df=reference_df,
         reference_profiles=reference_profiles,
@@ -502,6 +818,39 @@ def main():
             )
     else:
         logging.getLogger().setLevel(logging.CRITICAL + 1)
+
+    if is_main_process:
+        dataset_patch = {
+            "manifest_path": str(dataset_root / "manifests" / "dataset_manifest.json")
+            if (dataset_root / "manifests" / "dataset_manifest.json").exists()
+            else None,
+            "split_counts": {
+                "train_days": int(all_profile["train"].shape[0]),
+                "val_days": int(all_profile["val"].shape[0]),
+                "test_days": int(all_profile["test"].shape[0]),
+            },
+            "scaling": dataset_export_manifest.get("scaling") if dataset_export_manifest is not None else None,
+            "export_fingerprint": dataset_export_manifest.get("export_fingerprint") if dataset_export_manifest is not None else None,
+        }
+        if config.data.scaling_factor is not None:
+            dataset_patch["scaling_factor_used"] = [float(value) for value in config.data.scaling_factor]
+
+        merge_run_manifest(
+            run_layout.root,
+            {
+                "dataset": dataset_patch,
+                "model": {
+                    "model_class": config.model.model_class,
+                    "dim_base": int(config.model.dim_base),
+                    "num_attn_head": int(config.model.num_attn_head),
+                    "num_decoder_layer": int(getattr(config.model, "num_decoder_layer", 0) or 0),
+                    "dim_feedforward": int(config.model.dim_feedforward),
+                    "num_parameter": int(config.model.num_parameter) if config.model.num_parameter is not None else None,
+                    "num_channel": int(num_channel),
+                    "seq_length": int(seq_length),
+                },
+            },
+        )
 
     if config.model.resume:
         if config.model.load_time_id is None or config.model.load_milestone is None:
