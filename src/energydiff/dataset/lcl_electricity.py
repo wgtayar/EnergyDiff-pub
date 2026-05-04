@@ -3,6 +3,7 @@ Version 0 Design: Divide 168 .csv files into [130, 19, 19] as train, val, test
 """
 
 from typing import Annotated as Float
+import json
 import os
 
 import torch
@@ -130,6 +131,7 @@ class LCLElectricityProfile(TimeSeriesDataset):
         }
         
         self.hashed_option = self.hash_option(self.process_option)
+        self.dataset_manifest = self.load_dataset_manifest()
         processed_filename = self.get_processed_name()
             
         # Branch A: if processed data exists, load it
@@ -148,7 +150,28 @@ class LCLElectricityProfile(TimeSeriesDataset):
         print('Dataset ready.')
         
     def get_processed_name(self):
-        return f'{self.common_prefix}_processed_{self.hash_option(self.process_option)}.pt'
+        manifest_fingerprint = self.dataset_manifest.get('export_fingerprint', '')
+        suffix = f'_{manifest_fingerprint[:12]}' if manifest_fingerprint else ''
+        return f'{self.common_prefix}_processed_{self.hash_option(self.process_option)}{suffix}.pt'
+
+    def load_dataset_manifest(self):
+        manifest_path = os.path.join(self.root, 'manifests', 'dataset_manifest.json')
+        if not os.path.exists(manifest_path):
+            return {}
+        with open(manifest_path, 'r', encoding='utf-8') as handle:
+            loaded = json.load(handle)
+        return loaded if isinstance(loaded, dict) else {}
+
+    def manifest_scaling_factor(self):
+        scaling = self.dataset_manifest.get('scaling')
+        if not isinstance(scaling, dict):
+            return None
+        try:
+            max_value = float(scaling['max_value'])
+            min_value = float(scaling['min_value'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return max_value, min_value
             
     def create_dataset(self):
         # Branch B: if processed data does not exist, load raw data and process it
@@ -230,7 +253,16 @@ class LCLElectricityProfile(TimeSeriesDataset):
         # normalize
         scaling_factor = None
         if self.process_option['normalize']:
-            all_tensor, scaling_factor = self.normalize_fn(all_tensor)
+            manifest_scaling = self.manifest_scaling_factor()
+            if manifest_scaling is not None:
+                print(f'Using dataset manifest scaling factor: {manifest_scaling}')
+                all_tensor, scaling_factor = self.normalize_fn(
+                    all_tensor,
+                    min_value=manifest_scaling[1],
+                    max_value=manifest_scaling[0],
+                )
+            else:
+                all_tensor, scaling_factor = self.normalize_fn(all_tensor)
             
         # pit
         pit = None

@@ -187,6 +187,10 @@ class TrainConfig(BaseConfig):
     val_batch_size: int = 256
     diagnostic_test_metrics: bool = False
     save_plots_on_heavy_eval: bool = False
+    save_best_checkpoint: bool = False
+    best_checkpoint_metric: str = "validation_loss"
+    best_checkpoint_filename: str = "best_val.pt"
+    best_checkpoint_meta_filename: str = "best_val_meta.json"
     
     subconfigs = {'val_sample_config': SampleConfig}
     

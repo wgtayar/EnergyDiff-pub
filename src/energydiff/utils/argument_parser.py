@@ -129,6 +129,10 @@ def argument_parser() -> configuration.ExperimentConfig:
     parser.add_argument('--run_root', default=None, type=str, help='explicit run root for config, logs, checkpoints, samples, and eval outputs')
     parser.add_argument('--diagnostic_test_metrics', default=False, type=str2bool, help='whether checkpoint instrumentation should log test metrics as diagnostic-only')
     parser.add_argument('--save_plots_on_heavy_eval', default=False, type=str2bool, help='whether checkpoint instrumentation should save plots on heavy eval events')
+    parser.add_argument('--save_best_checkpoint', default=False, type=str2bool, help='whether to preserve a best validation checkpoint artifact during training')
+    parser.add_argument('--best_checkpoint_metric', default='validation_loss', type=str, help='criterion used to select best_val.pt; one of [validation_loss, industrial_val_score]')
+    parser.add_argument('--best_checkpoint_filename', default='best_val.pt', type=str, help='filename for the saved best validation checkpoint')
+    parser.add_argument('--best_checkpoint_meta_filename', default='best_val_meta.json', type=str, help='filename for best validation checkpoint metadata')
     
     # Sample and test Parameters
     parser.add_argument('--val_batch_size', default=None, type=int, help='batch size for validation/testing')
@@ -271,6 +275,10 @@ def argument_parser() -> configuration.ExperimentConfig:
         val_batch_size=args.val_batch_size,
         diagnostic_test_metrics=args.diagnostic_test_metrics,
         save_plots_on_heavy_eval=args.save_plots_on_heavy_eval,
+        save_best_checkpoint=args.save_best_checkpoint,
+        best_checkpoint_metric=args.best_checkpoint_metric,
+        best_checkpoint_filename=args.best_checkpoint_filename,
+        best_checkpoint_meta_filename=args.best_checkpoint_meta_filename,
     )
     
     # 2.5 final sample config

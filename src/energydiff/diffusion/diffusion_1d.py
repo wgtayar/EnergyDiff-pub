@@ -1183,7 +1183,7 @@ class Trainer1D():
     def device(self):
         return self.accelerator.device
     
-    def save(self, milestone):
+    def save(self, milestone = None, filename: str | None = None):
         if not self.accelerator.is_local_main_process:
             return None
 
@@ -1196,8 +1196,13 @@ class Trainer1D():
                 if self.accelerator.scaler is not None else None, # scaler will be None if accelerator does not have a scaler
             'version': __version__
         }
-        
-        save_path = os.path.join(self.result_folder, self.log_id+'-'+f'model-{milestone}.pt')
+
+        if filename is not None:
+            save_path = os.path.join(self.result_folder, filename)
+        else:
+            if milestone is None:
+                raise ValueError("milestone is required when filename is not provided.")
+            save_path = os.path.join(self.result_folder, self.log_id+'-'+f'model-{milestone}.pt')
         torch.save(to_save, save_path)
         return Path(save_path)
     
